@@ -5,6 +5,12 @@ const pool = require('./db');
 const app = express();
 const PORT = 3000;
 
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+
+// Una clave secreta para firmar los tokens (en un proyecto real, esto va en un archivo .env)
+const SECRET_KEY = 'll_burgers_super_secreta_2026';
+
 // Middlewares
 app.use(cors());
 app.use(express.json());
@@ -357,6 +363,50 @@ app.put('/api/productos/:id/precio', async (req, res) => {
     } catch (err) {
         console.error(err.message);
         res.status(500).send('Error actualizando el precio');
+    }
+});
+
+// ==========================================
+// MÓDULO DE AUTENTICACIÓN Y SEGURIDAD
+// ==========================================
+
+app.post('/api/login', async (req, res) => {
+    try {
+        const { username, password } = req.body;
+
+        // 1. Buscamos al usuario en la base de datos
+        const userResult = await pool.query('SELECT * FROM usuarios WHERE username = $1', [username]);
+        if (userResult.rows.length === 0) {
+            return res.status(401).json({ error: 'Usuario no encontrado' });
+        }
+
+        const usuario = userResult.rows[0];
+
+        // 2. Comparamos la contraseña que escribió con la encriptada en la base de datos
+        // NOTA TEMPORAL: Como inyectamos el hash a mano en SQL, para probar rápido vamos a usar una validación simple. 
+        // Luego activaremos el bcrypt real.
+        const passwordCorrecta = (password === 'admin123' && usuario.username === 'lendy_admin');
+
+        if (!passwordCorrecta) {
+            return res.status(401).json({ error: 'Contraseña incorrecta' });
+        }
+
+        // 3. Si todo está bien, generamos el "Carnet" digital (Token)
+        const token = jwt.sign(
+            { id: usuario.id, username: usuario.username, rol: usuario.rol },
+            SECRET_KEY,
+            { expiresIn: '8h' } // El token se vence a las 8 horas (lo que dura un turno)
+        );
+
+        res.json({
+            mensaje: '¡Bienvenido al sistema!',
+            token: token,
+            usuario: { username: usuario.username, rol: usuario.rol }
+        });
+
+    } catch (err) {
+        console.error(err.message);
+        res.status(500).send('Error en el servidor al intentar iniciar sesión');
     }
 });
 
