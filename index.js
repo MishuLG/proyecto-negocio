@@ -1,416 +1,300 @@
 const express = require('express');
 const cors = require('cors');
-const pool = require('./db');
-
-const app = express();
-const PORT = 3000;
-
+const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 
-// Una clave secreta para firmar los tokens (en un proyecto real, esto va en un archivo .env)
-const SECRET_KEY = 'll_burgers_super_secreta_2026';
-
-// Middlewares
+const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Ruta de prueba para verificar el motor
-app.get('/api/estado', async (req, res) => {
+// Clave secreta para los Tokens de sesión
+const SECRET_KEY = 'll_burgers_super_secreta_2026';
+
+// Conexión a la base de datos (Recuerda poner tu contraseña real)
+const pool = new Pool({
+    user: 'postgres',
+    host: 'localhost',
+    database: 'sistema_negocio',
+    password: '1234',
+    port: 5432,
+});
+
+// ==========================================
+// 1. AUTENTICACIÓN Y SEGURIDAD
+// ==========================================
+app.post('/api/login', async (req, res) => {
     try {
-        // Le pedimos a PostgreSQL que nos devuelva la hora del sistema
-        const result = await pool.query('SELECT NOW()');
-        res.json({
-            mensaje: '¡El motor del sistema está en línea y conectado a PostgreSQL!',
-            hora_servidor: result.rows[0].now
-        });
+        const { username, password } = req.body;
+        const userResult = await pool.query('SELECT * FROM usuarios WHERE username = $1', [username]);
+        if (userResult.rows.length === 0) return res.status(401).json({ error: 'Usuario no encontrado' });
+
+        const usuario = userResult.rows[0];
+        const passwordCorrecta = (password === 'admin123' && usuario.username === 'lendy_admin');
+
+        if (!passwordCorrecta) return res.status(401).json({ error: 'Contraseña incorrecta' });
+
+        const token = jwt.sign({ id: usuario.id, username: usuario.username, rol: usuario.rol }, SECRET_KEY, { expiresIn: '8h' });
+        res.json({ mensaje: 'Bienvenido', token, usuario: { username: usuario.username, rol: usuario.rol } });
     } catch (err) {
-        console.error(err.message);
-        res.status(500).send('Error conectando a la base de datos');
+        res.status(500).send('Error en login');
     }
 });
 
 // ==========================================
-// MÓDULO DE CATEGORÍAS Y PRODUCTOS
+// 2. TASAS DE CAMBIO
 // ==========================================
-
-// 1. Crear una nueva categoría (Ej: "Desayunos" o "Comida Rápida")
-app.post('/api/categorias', async (req, res) => {
+app.post('/api/tasas', async (req, res) => {
     try {
-        const { nombre, turno } = req.body; // turno puede ser: 'Mañana', 'Noche', 'Ambos'
-        const nuevoRegistro = await pool.query(
-            'INSERT INTO categorias (nombre, turno) VALUES ($1, $2) RETURNING *',
-            [nombre, turno]
-        );
-        res.json({ mensaje: 'Categoría creada', categoria: nuevoRegistro.rows[0] });
+        const { moneda, tasa } = req.body;
+        const existe = await pool.query('SELECT id FROM tasas_cambio WHERE moneda = $1', [moneda]);
+        if (existe.rows.length > 0) {
+            await pool.query('UPDATE tasas_cambio SET tasa = $1, fecha_actualizacion = CURRENT_TIMESTAMP WHERE moneda = $2', [tasa, moneda]);
+        } else {
+            await pool.query('INSERT INTO tasas_cambio (moneda, tasa) VALUES ($1, $2)', [moneda, tasa]);
+        }
+        res.json({ mensaje: 'Tasa actualizada' });
     } catch (err) {
-        console.error(err.message);
-        res.status(500).send('Error en el servidor al crear categoría');
+        res.status(500).send('Error actualizando tasa');
     }
 });
 
-// 2. Crear un nuevo producto (Ej: "Hamburguesa Especial")
-app.post('/api/productos', async (req, res) => {
+app.get('/api/tasas', async (req, res) => {
     try {
-        const { nombre, categoria_id, precio_venta_usd } = req.body;
-        const nuevoProducto = await pool.query(
-            'INSERT INTO productos (nombre, categoria_id, precio_venta_usd) VALUES ($1, $2, $3) RETURNING *',
-            [nombre, categoria_id, precio_venta_usd]
-        );
-        res.json({ mensaje: 'Producto creado', producto: nuevoProducto.rows[0] });
+        const tasas = await pool.query('SELECT * FROM tasas_cambio');
+        res.json(tasas.rows);
     } catch (err) {
-        console.error(err.message);
-        res.status(500).send('Error en el servidor al crear producto');
-    }
-});
-
-// 3. Ver todos los productos con su categoría y turno asignado
-app.get('/api/productos', async (req, res) => {
-    try {
-        const todosLosProductos = await pool.query(`
-      SELECT p.id, p.nombre AS producto, p.precio_venta_usd, c.nombre AS categoria, c.turno
-      FROM productos p
-      JOIN categorias c ON p.categoria_id = c.id
-      WHERE p.disponible = TRUE
-    `);
-        res.json(todosLosProductos.rows);
-    } catch (err) {
-        console.error(err.message);
-        res.status(500).send('Error en el servidor al obtener productos');
+        res.status(500).send('Error obteniendo tasas');
     }
 });
 
 // ==========================================
-// MÓDULO DE VENTAS Y PEDIDOS
+// 3. INVENTARIO, RECETAS Y COSTOS (Adaptado a COP)
 // ==========================================
-
-// 1. Abrir un nuevo pedido (El "Ticket" principal)
-app.post('/api/pedidos', async (req, res) => {
-    try {
-        // cliente_id puede ser null si es un cliente de paso que no registras
-        const { cliente_id, total_usd, turno, observaciones } = req.body;
-
-        const nuevoPedido = await pool.query(
-            `INSERT INTO pedidos (cliente_id, total_usd, turno, observaciones) 
-       VALUES ($1, $2, $3, $4) RETURNING *`,
-            [cliente_id, total_usd, turno, observaciones]
-        );
-
-        res.json({
-            mensaje: 'Pedido abierto con éxito',
-            pedido: nuevoPedido.rows[0]
-        });
-    } catch (err) {
-        console.error(err.message);
-        res.status(500).send('Error en el servidor al crear el pedido');
-    }
-});
-
-// 2. Agregar productos a un pedido específico
-app.post('/api/pedidos/:id/detalles', async (req, res) => {
-    try {
-        const pedido_id = req.params.id;
-        const { producto_id, cantidad, precio_unitario_usd } = req.body;
-        const subtotal_usd = cantidad * precio_unitario_usd;
-
-        const nuevoDetalle = await pool.query(
-            `INSERT INTO detalle_pedidos (pedido_id, producto_id, cantidad, precio_unitario_usd, subtotal_usd) 
-       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-            [pedido_id, producto_id, cantidad, precio_unitario_usd, subtotal_usd]
-        );
-
-        res.json({
-            mensaje: 'Producto agregado al pedido',
-            detalle: nuevoDetalle.rows[0]
-        });
-    } catch (err) {
-        console.error(err.message);
-        res.status(500).send('Error en el servidor al agregar detalle al pedido');
-    }
-});
-
-// 3. Ver las ventas del día (Ideal para hacer el corte de caja)
-app.get('/api/ventas/hoy', async (req, res) => {
-    try {
-        const ventasHoy = await pool.query(`
-      SELECT id, total_usd, estado_pago, turno, observaciones, fecha_hora 
-      FROM pedidos 
-      WHERE DATE(fecha_hora) = CURRENT_DATE
-      ORDER BY fecha_hora DESC
-    `);
-
-        // Sumamos el total del día para tener la métrica rápida
-        const totalCaja = ventasHoy.rows.reduce((acc, pedido) => acc + parseFloat(pedido.total_usd), 0);
-
-        res.json({
-            total_recaudado_usd: totalCaja,
-            cantidad_pedidos: ventasHoy.rows.length,
-            pedidos: ventasHoy.rows
-        });
-    } catch (err) {
-        console.error(err.message);
-        res.status(500).send('Error al obtener las ventas del día');
-    }
-});
-
-// ==========================================
-// MÓDULO DE INVENTARIO Y RECETAS (COSTOS)
-// ==========================================
-
-// 1. Registrar un insumo/materia prima (Ej: Carne molida)
 app.post('/api/insumos', async (req, res) => {
     try {
         const { nombre, unidad_medida, costo_actual, stock_actual } = req.body;
         const nuevoInsumo = await pool.query(
-            `INSERT INTO insumos (nombre, unidad_medida, costo_actual, stock_actual) 
-       VALUES ($1, $2, $3, $4) RETURNING *`,
+            `INSERT INTO insumos (nombre, unidad_medida, costo_actual, stock_actual) VALUES ($1, $2, $3, $4) RETURNING *`,
             [nombre, unidad_medida, costo_actual, stock_actual]
         );
         res.json({ mensaje: 'Insumo registrado', insumo: nuevoInsumo.rows[0] });
     } catch (err) {
-        console.error(err.message);
         res.status(500).send('Error al registrar insumo');
     }
 });
 
-// 2. Armar la receta (Ej: La Hamburguesa Especial lleva 0.150 Kg de carne)
 app.post('/api/recetas', async (req, res) => {
     try {
         const { producto_id, insumo_id, cantidad_necesaria } = req.body;
         const nuevaReceta = await pool.query(
-            `INSERT INTO recetas (producto_id, insumo_id, cantidad_necesaria) 
-       VALUES ($1, $2, $3) RETURNING *`,
+            `INSERT INTO recetas (producto_id, insumo_id, cantidad_necesaria) VALUES ($1, $2, $3) RETURNING *`,
             [producto_id, insumo_id, cantidad_necesaria]
         );
         res.json({ mensaje: 'Ingrediente agregado a la receta', receta: nuevaReceta.rows[0] });
     } catch (err) {
-        console.error(err.message);
         res.status(500).send('Error al armar la receta');
     }
 });
 
-// 3. LA MAGIA: Calcular cuánto cuesta hacer un producto
 app.get('/api/productos/:id/costo', async (req, res) => {
     try {
         const producto_id = req.params.id;
         const calculo = await pool.query(`
       SELECT 
         p.nombre AS producto,
-        p.precio_venta_usd,
-        COALESCE(SUM(i.costo_actual * r.cantidad_necesaria), 0) AS costo_produccion_usd,
-        (p.precio_venta_usd - COALESCE(SUM(i.costo_actual * r.cantidad_necesaria), 0)) AS ganancia_neta_usd
+        p.precio_venta_cop,
+        COALESCE(SUM(i.costo_actual * r.cantidad_necesaria), 0) AS costo_produccion_cop,
+        (p.precio_venta_cop - COALESCE(SUM(i.costo_actual * r.cantidad_necesaria), 0)) AS ganancia_neta_cop
       FROM productos p
       LEFT JOIN recetas r ON p.id = r.producto_id
       LEFT JOIN insumos i ON r.insumo_id = i.id
       WHERE p.id = $1
       GROUP BY p.id
     `, [producto_id]);
-
         res.json(calculo.rows[0]);
     } catch (err) {
-        console.error(err.message);
         res.status(500).send('Error calculando el costo del producto');
     }
 });
 
 // ==========================================
-// MÓDULO MULTIMONEDA Y TASAS DE CAMBIO
+// 4. PRODUCTOS Y CATÁLOGO (Adaptado a COP)
 // ==========================================
-
-// 1. Actualizar o registrar la tasa del día (Ej: COP o BS)
-app.post('/api/tasas', async (req, res) => {
+app.get('/api/productos', async (req, res) => {
     try {
-        const { moneda, tasa } = req.body;
+        const productos = await pool.query(`
+      SELECT p.id, p.nombre AS producto, p.precio_venta_cop, c.id AS categoria_id, c.nombre AS turno 
+      FROM productos p JOIN categorias c ON p.categoria_id = c.id
+      ORDER BY p.id ASC
+    `);
+        res.json(productos.rows);
+    } catch (err) {
+        console.error("🔥 ERROR EXACTO DE SQL:", err.message); // <-- Esto nos dirá la verdad
+        res.status(500).send('Error cargando productos');
+    }
+});
 
-        // Primero revisamos si esa moneda ya la teníamos registrada
-        const existe = await pool.query('SELECT id FROM tasas_cambio WHERE moneda = $1', [moneda]);
+app.post('/api/productos', async (req, res) => {
+    try {
+        const { nombre, categoria_id, precio_venta_cop } = req.body;
+        await pool.query('INSERT INTO productos (nombre, categoria_id, precio_venta_cop) VALUES ($1, $2, $3)', [nombre, categoria_id, precio_venta_cop]);
+        res.json({ mensaje: 'Producto creado' });
+    } catch (err) {
+        res.status(500).send('Error creando producto');
+    }
+});
 
-        let resultado;
-        if (existe.rows.length > 0) {
-            // Si existe, solo actualizamos el valor y la hora
-            resultado = await pool.query(
-                'UPDATE tasas_cambio SET tasa = $1, fecha_actualizacion = CURRENT_TIMESTAMP WHERE moneda = $2 RETURNING *',
-                [tasa, moneda]
-            );
+app.put('/api/productos/:id', async (req, res) => {
+    try {
+        const { nombre, categoria_id, precio_venta_cop } = req.body;
+        await pool.query('UPDATE productos SET nombre = $1, categoria_id = $2, precio_venta_cop = $3 WHERE id = $4', [nombre, categoria_id, precio_venta_cop, req.params.id]);
+        res.json({ mensaje: 'Producto actualizado' });
+    } catch (err) {
+        res.status(500).send('Error actualizando producto');
+    }
+});
+
+app.delete('/api/productos/:id', async (req, res) => {
+    try {
+        await pool.query('DELETE FROM productos WHERE id = $1', [req.params.id]);
+        res.json({ mensaje: 'Producto eliminado' });
+    } catch (err) {
+        res.status(500).send('Error eliminando producto');
+    }
+});
+
+// ==========================================
+// 5. CLIENTES Y CHECKOUT POS (Adaptado a COP)
+// ==========================================
+app.get('/api/clientes/cedula/:cedula', async (req, res) => {
+    try {
+        const result = await pool.query('SELECT id, nombre, cedula FROM clientes WHERE cedula = $1', [req.params.cedula]);
+        res.json(result.rows[0] || null);
+    } catch (err) {
+        res.status(500).send('Error buscando cliente');
+    }
+});
+
+app.get('/api/dashboard/ventas-hoy', async (req, res) => {
+    try {
+        const ventas = await pool.query(`
+      SELECT p.id, p.total_cop, p.estado_pago, p.fecha_hora, p.turno, c.nombre, c.cedula
+      FROM pedidos p LEFT JOIN clientes c ON p.cliente_id = c.id
+      WHERE DATE(p.fecha_hora) = CURRENT_DATE ORDER BY p.fecha_hora DESC
+    `);
+        res.json(ventas.rows);
+    } catch (err) {
+        res.status(500).send('Error cargando ventas');
+    }
+});
+
+app.get('/api/pedidos/abiertos', async (req, res) => {
+    try {
+        const pedidos = await pool.query(`
+      SELECT p.id, c.nombre, p.total_cop 
+      FROM pedidos p LEFT JOIN clientes c ON p.cliente_id = c.id 
+      WHERE DATE(p.fecha_hora) = CURRENT_DATE AND p.estado_pago != 'Pagado'
+    `);
+        res.json(pedidos.rows);
+    } catch (err) {
+        res.status(500).send('Error buscando pedidos');
+    }
+});
+
+app.post('/api/checkout', async (req, res) => {
+    try {
+        const { cedula, nombre, turno, carrito, pedido_id_existente } = req.body;
+        let cliente_id = null;
+
+        if (cedula) {
+            const clienteRes = await pool.query('SELECT id FROM clientes WHERE cedula = $1', [cedula]);
+            if (clienteRes.rows.length > 0) {
+                cliente_id = clienteRes.rows[0].id;
+            } else if (nombre) {
+                const nuevoCli = await pool.query('INSERT INTO clientes (nombre, cedula) VALUES ($1, $2) RETURNING id', [nombre, cedula]);
+                cliente_id = nuevoCli.rows[0].id;
+            }
+        }
+
+        let pedido_id = pedido_id_existente;
+        let total_cop_carrito = carrito.reduce((acc, item) => acc + (parseFloat(item.precio_venta_cop) * item.cantidad), 0);
+
+        if (pedido_id) {
+            await pool.query('UPDATE pedidos SET total_cop = total_cop + $1 WHERE id = $2', [total_cop_carrito, pedido_id]);
         } else {
-            // Si es nueva, la creamos
-            resultado = await pool.query(
-                'INSERT INTO tasas_cambio (moneda, tasa) VALUES ($1, $2) RETURNING *',
-                [moneda, tasa]
+            const nuevoPed = await pool.query(
+                "INSERT INTO pedidos (cliente_id, total_cop, turno, estado_pago) VALUES ($1, $2, $3, 'Abierto') RETURNING id",
+                [cliente_id, total_cop_carrito, turno]
+            );
+            pedido_id = nuevoPed.rows[0].id;
+        }
+
+        for (let item of carrito) {
+            await pool.query(
+                'INSERT INTO detalle_pedidos (pedido_id, producto_id, cantidad, precio_unitario_cop, subtotal_cop) VALUES ($1, $2, $3, $4, $5)',
+                [pedido_id, item.id, item.cantidad, item.precio_venta_cop, item.cantidad * item.precio_venta_cop]
             );
         }
 
-        res.json({ mensaje: `Tasa de ${moneda} actualizada con éxito`, tasa: resultado.rows[0] });
+        res.json({ mensaje: 'Operación exitosa', pedido_id });
     } catch (err) {
-        console.error(err.message);
-        res.status(500).send('Error al actualizar la tasa de cambio');
-    }
-});
-
-// 2. Ver todas las tasas activas actualmente
-app.get('/api/tasas', async (req, res) => {
-    try {
-        const tasas = await pool.query('SELECT * FROM tasas_cambio');
-        res.json(tasas.rows);
-    } catch (err) {
-        console.error(err.message);
-        res.status(500).send('Error obteniendo las tasas');
-    }
-});
-
-// 3. LA CALCULADORA MÁGICA: Obtener el total de un pedido en todas las monedas
-app.get('/api/pedidos/:id/totales', async (req, res) => {
-    try {
-        const pedido_id = req.params.id;
-
-        // Buscamos el total del ticket en dólares
-        const pedido = await pool.query('SELECT total_usd FROM pedidos WHERE id = $1', [pedido_id]);
-        if (pedido.rows.length === 0) return res.status(404).send('Pedido no encontrado');
-
-        const totalUsd = parseFloat(pedido.rows[0].total_usd);
-
-        // Traemos las tasas de la base de datos
-        const tasas = await pool.query('SELECT moneda, tasa FROM tasas_cambio');
-
-        // Empezamos a armar el recibo final
-        let recibo = {
-            Total_USD: totalUsd.toFixed(2),
-        };
-
-        // Multiplicamos el total en dólares por cada tasa que tengas registrada
-        tasas.rows.forEach(t => {
-            recibo[`Total_${t.moneda}`] = (totalUsd * parseFloat(t.tasa)).toFixed(2);
-        });
-
-        res.json({
-            mensaje: 'Cálculo generado al instante',
-            recibo_cliente: recibo
-        });
-    } catch (err) {
-        console.error(err.message);
-        res.status(500).send('Error calculando totales multimoneda');
+        res.status(500).send('Error procesando venta');
     }
 });
 
 // ==========================================
-// MÓDULO DE PAGOS Y CUENTAS POR COBRAR (FIADOS)
+// 6. PAGOS PARCIALES Y CUENTAS POR COBRAR (FIADOS)
 // ==========================================
-
-// 1. Registrar un pago parcial o total a una factura
 app.post('/api/pedidos/:id/pagos', async (req, res) => {
     try {
         const pedido_id = req.params.id;
         const { monto_pagado, moneda_pago, tasa_aplicada, cliente_id } = req.body;
 
-        // Registramos el pago en el historial
         const nuevoPago = await pool.query(
-            `INSERT INTO pagos (pedido_id, monto_pagado, moneda_pago, tasa_aplicada) 
-       VALUES ($1, $2, $3, $4) RETURNING *`,
+            `INSERT INTO pagos (pedido_id, monto_pagado, moneda_pago, tasa_aplicada) VALUES ($1, $2, $3, $4) RETURNING *`,
             [pedido_id, monto_pagado, moneda_pago, tasa_aplicada]
         );
 
-        // Actualizamos el estado del pedido a "Parcial"
-        await pool.query(
-            `UPDATE pedidos SET estado_pago = 'Parcial' WHERE id = $1`,
-            [pedido_id]
-        );
+        await pool.query(`UPDATE pedidos SET estado_pago = 'Parcial' WHERE id = $1`, [pedido_id]);
 
-        // Si hay un cliente asociado, le sumamos este movimiento a su perfil
-        // (En un sistema avanzado, aquí restaríamos la deuda total del cliente)
+        // Si la base es COP, restamos el equivalente en COP de la deuda
         if (cliente_id) {
+            // Suponiendo que el pago entra en pesos, o se convierte a pesos según la tasa_aplicada
+            const abono_en_cop = moneda_pago === 'COP' ? monto_pagado : (monto_pagado * tasa_aplicada);
             await pool.query(
                 `UPDATE clientes SET deuda_total = deuda_total - $1 WHERE id = $2`,
-                [(monto_pagado / tasa_aplicada), cliente_id] // Convertimos el pago a USD para restar
+                [abono_en_cop, cliente_id]
             );
         }
 
         res.json({ mensaje: 'Pago registrado exitosamente', recibo: nuevoPago.rows[0] });
     } catch (err) {
-        console.error(err.message);
         res.status(500).send('Error al procesar el pago');
     }
 });
 
-// 2. Ver la lista negra (Clientes que deben dinero)
 app.get('/api/clientes/deudores', async (req, res) => {
     try {
         const deudores = await pool.query(`
-      SELECT id, nombre, telefono, deuda_total 
+      SELECT id, nombre, telefono, cedula, deuda_total 
       FROM clientes 
       WHERE deuda_total > 0
       ORDER BY deuda_total DESC
     `);
 
         res.json({
-            total_dinero_en_calle_usd: deudores.rows.reduce((acc, c) => acc + parseFloat(c.deuda_total), 0),
+            total_dinero_en_calle_cop: deudores.rows.reduce((acc, c) => acc + parseFloat(c.deuda_total), 0),
             clientes: deudores.rows
         });
     } catch (err) {
-        console.error(err.message);
         res.status(500).send('Error consultando deudores');
     }
 });
 
-// Actualizar el precio de un producto en tiempo real
-app.put('/api/productos/:id/precio', async (req, res) => {
-    try {
-        const { nuevo_precio } = req.body;
-        const actualizado = await pool.query(
-            'UPDATE productos SET precio_venta_usd = $1 WHERE id = $2 RETURNING *',
-            [nuevo_precio, req.params.id]
-        );
-        res.json({ mensaje: 'Precio actualizado', producto: actualizado.rows[0] });
-    } catch (err) {
-        console.error(err.message);
-        res.status(500).send('Error actualizando el precio');
-    }
-});
-
 // ==========================================
-// MÓDULO DE AUTENTICACIÓN Y SEGURIDAD
+// ARRANQUE DEL SERVIDOR
 // ==========================================
-
-app.post('/api/login', async (req, res) => {
-    try {
-        const { username, password } = req.body;
-
-        // 1. Buscamos al usuario en la base de datos
-        const userResult = await pool.query('SELECT * FROM usuarios WHERE username = $1', [username]);
-        if (userResult.rows.length === 0) {
-            return res.status(401).json({ error: 'Usuario no encontrado' });
-        }
-
-        const usuario = userResult.rows[0];
-
-        // 2. Comparamos la contraseña que escribió con la encriptada en la base de datos
-        // NOTA TEMPORAL: Como inyectamos el hash a mano en SQL, para probar rápido vamos a usar una validación simple. 
-        // Luego activaremos el bcrypt real.
-        const passwordCorrecta = (password === 'admin123' && usuario.username === 'lendy_admin');
-
-        if (!passwordCorrecta) {
-            return res.status(401).json({ error: 'Contraseña incorrecta' });
-        }
-
-        // 3. Si todo está bien, generamos el "Carnet" digital (Token)
-        const token = jwt.sign(
-            { id: usuario.id, username: usuario.username, rol: usuario.rol },
-            SECRET_KEY,
-            { expiresIn: '8h' } // El token se vence a las 8 horas (lo que dura un turno)
-        );
-
-        res.json({
-            mensaje: '¡Bienvenido al sistema!',
-            token: token,
-            usuario: { username: usuario.username, rol: usuario.rol }
-        });
-
-    } catch (err) {
-        console.error(err.message);
-        res.status(500).send('Error en el servidor al intentar iniciar sesión');
-    }
-});
-
-// Encendemos el servidor
-app.listen(PORT, () => {
-    console.log(`Servidor de control corriendo en http://localhost:${PORT}`);
+app.listen(3000, () => {
+    console.log('🚀 Servidor Backend corriendo en el puerto 3000 (100% Moneda Base: COP)');
 });
