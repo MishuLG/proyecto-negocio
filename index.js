@@ -11,7 +11,7 @@ app.use(express.json());
 // Clave secreta para los Tokens de sesión
 const SECRET_KEY = 'll_burgers_super_secreta_2026';
 
-// Conexión a la base de datos (Recuerda poner tu contraseña real)
+// Conexión a la base de datos
 const pool = new Pool({
     user: 'postgres',
     host: 'localhost',
@@ -125,12 +125,12 @@ app.get('/api/productos', async (req, res) => {
     try {
         const productos = await pool.query(`
       SELECT p.id, p.nombre AS producto, p.precio_venta_cop, c.id AS categoria_id, c.nombre AS turno 
-      FROM productos p JOIN categorias c ON p.categoria_id = c.id
+      FROM productos p LEFT JOIN categorias c ON p.categoria_id = c.id
       ORDER BY p.id ASC
     `);
         res.json(productos.rows);
     } catch (err) {
-        console.error("🔥 ERROR EXACTO DE SQL:", err.message); // <-- Esto nos dirá la verdad
+        console.error("🔥 ERROR EXACTO DE SQL:", err.message);
         res.status(500).send('Error cargando productos');
     }
 });
@@ -176,15 +176,24 @@ app.get('/api/clientes/cedula/:cedula', async (req, res) => {
     }
 });
 
-app.get('/api/dashboard/ventas-hoy', async (req, res) => {
+// ======== ESTA ES LA NUEVA RUTA CON FILTRO DE FECHA ========
+app.get('/api/dashboard/ventas', async (req, res) => {
     try {
+        const { fecha } = req.query;
+        // Si no nos mandan fecha, usamos la fecha de hoy por defecto
+        const filtroFecha = fecha ? fecha : new Date().toLocaleDateString('en-CA');
+
         const ventas = await pool.query(`
-      SELECT p.id, p.total_cop, p.estado_pago, p.fecha_hora, p.turno, c.nombre, c.cedula
-      FROM pedidos p LEFT JOIN clientes c ON p.cliente_id = c.id
-      WHERE DATE(p.fecha_hora) = CURRENT_DATE ORDER BY p.fecha_hora DESC
-    `);
+          SELECT p.id, p.total_cop, p.estado_pago, p.fecha_hora, p.turno, c.nombre, c.cedula,
+                 COALESCE((SELECT SUM(monto_pagado) FROM pagos WHERE pedido_id = p.id), 0) AS pagado
+          FROM pedidos p LEFT JOIN clientes c ON p.cliente_id = c.id
+          WHERE DATE(p.fecha_hora) = $1 
+          ORDER BY p.fecha_hora DESC
+        `, [filtroFecha]);
+
         res.json(ventas.rows);
     } catch (err) {
+        console.error("Error cargando ventas:", err);
         res.status(500).send('Error cargando ventas');
     }
 });
@@ -298,6 +307,7 @@ app.post('/api/pedidos/:id/pagos', async (req, res) => {
     }
 });
 
+// MÓDULO DE COBRANZA 
 app.get('/api/clientes/deudores', async (req, res) => {
     try {
         const deudores = await pool.query(`
@@ -313,6 +323,28 @@ app.get('/api/clientes/deudores', async (req, res) => {
         });
     } catch (err) {
         res.status(500).send('Error consultando deudores');
+    }
+});
+
+// Cobrar una deuda a un cliente
+app.post('/api/clientes/:id/pagar-deuda', async (req, res) => {
+    try {
+        const { monto_abonado } = req.body;
+
+        // 1. Descontamos el dinero de la deuda del cliente
+        await pool.query('UPDATE clientes SET deuda_total = deuda_total - $1 WHERE id = $2', [monto_abonado, req.params.id]);
+
+        const clienteRes = await pool.query('SELECT deuda_total FROM clientes WHERE id = $1', [req.params.id]);
+
+        // 2. Si la cuenta llega a 0, pasamos automáticamente todas sus facturas a "Pagado"
+        if (parseFloat(clienteRes.rows[0].deuda_total) <= 0) {
+            await pool.query("UPDATE pedidos SET estado_pago = 'Pagado' WHERE cliente_id = $1 AND estado_pago = 'Parcial'", [req.params.id]);
+            await pool.query('UPDATE clientes SET deuda_total = 0 WHERE id = $1', [req.params.id]); // Evita números negativos
+        }
+
+        res.json({ mensaje: 'Abono registrado con éxito' });
+    } catch (err) {
+        res.status(500).json({ error: 'Error procesando abono a la deuda' });
     }
 });
 
