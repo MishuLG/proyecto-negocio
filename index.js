@@ -47,6 +47,10 @@ app.post('/api/login', async (req, res) => {
 app.post('/api/tasas', async (req, res) => {
     try {
         const { moneda, tasa } = req.body;
+
+        // VALIDACIÓN: Tasa mayor a 0
+        if (!tasa || parseFloat(tasa) <= 0) return res.status(400).json({ error: 'La tasa debe ser mayor a 0' });
+
         const existe = await pool.query('SELECT id FROM tasas_cambio WHERE moneda = $1', [moneda]);
         if (existe.rows.length > 0) {
             await pool.query('UPDATE tasas_cambio SET tasa = $1, fecha_actualizacion = CURRENT_TIMESTAMP WHERE moneda = $2', [tasa, moneda]);
@@ -138,6 +142,11 @@ app.get('/api/productos', async (req, res) => {
 app.post('/api/productos', async (req, res) => {
     try {
         const { nombre, categoria_id, precio_venta_cop } = req.body;
+
+        // VALIDACIÓN: Evitar productos sin nombre o precios en cero
+        if (!nombre || nombre.trim() === '') return res.status(400).json({ error: 'El nombre del producto es obligatorio' });
+        if (!precio_venta_cop || parseFloat(precio_venta_cop) <= 0) return res.status(400).json({ error: 'El precio debe ser mayor a 0' });
+
         await pool.query('INSERT INTO productos (nombre, categoria_id, precio_venta_cop) VALUES ($1, $2, $3)', [nombre, categoria_id, precio_venta_cop]);
         res.json({ mensaje: 'Producto creado' });
     } catch (err) {
@@ -148,6 +157,11 @@ app.post('/api/productos', async (req, res) => {
 app.put('/api/productos/:id', async (req, res) => {
     try {
         const { nombre, categoria_id, precio_venta_cop } = req.body;
+
+        // VALIDACIÓN: Evitar dejar un producto en blanco al editar
+        if (!nombre || nombre.trim() === '') return res.status(400).json({ error: 'El nombre del producto no puede estar vacío' });
+        if (!precio_venta_cop || parseFloat(precio_venta_cop) <= 0) return res.status(400).json({ error: 'El precio debe ser mayor a 0' });
+
         await pool.query('UPDATE productos SET nombre = $1, categoria_id = $2, precio_venta_cop = $3 WHERE id = $4', [nombre, categoria_id, precio_venta_cop, req.params.id]);
         res.json({ mensaje: 'Producto actualizado' });
     } catch (err) {
@@ -176,7 +190,6 @@ app.get('/api/clientes/cedula/:cedula', async (req, res) => {
     }
 });
 
-// ======== ESTA ES LA NUEVA RUTA CON FILTRO DE FECHA ========
 app.get('/api/dashboard/ventas', async (req, res) => {
     try {
         const { fecha } = req.query;
@@ -215,6 +228,10 @@ app.post('/api/checkout', async (req, res) => {
     try {
         // 1. Recibimos el "abono" desde React
         const { cedula, nombre, turno, carrito, pedido_id_existente, abono } = req.body;
+
+        // VALIDACIÓN: Ticket vacío
+        if (!carrito || carrito.length === 0) return res.status(400).json({ error: 'El ticket no puede estar vacío' });
+
         let cliente_id = null;
 
         if (cedula) {
@@ -230,8 +247,12 @@ app.post('/api/checkout', async (req, res) => {
         let total_cop_carrito = carrito.reduce((acc, item) => acc + (parseFloat(item.precio_venta_cop) * item.cantidad), 0);
 
         // 2. CÁLCULO DE LA DEUDA Y EL ABONO
-        // Si la caja del abono viene vacía, asumimos que pagó el 100%
         let monto_pagado = (abono !== undefined && abono !== '') ? parseFloat(abono) : total_cop_carrito;
+
+        // VALIDACIÓN: Abonos inválidos
+        if (monto_pagado < 0) return res.status(400).json({ error: 'El abono no puede ser negativo' });
+        if (monto_pagado > total_cop_carrito) return res.status(400).json({ error: 'El abono inicial no puede ser mayor al total del pedido' });
+
         let deuda_generada = total_cop_carrito - monto_pagado;
 
         // 3. REGLA DE ORO: No hay fiado para fantasmas
@@ -277,7 +298,7 @@ app.post('/api/checkout', async (req, res) => {
 });
 
 // ==========================================
-// 6. PAGOS PARCIALES Y CUENTAS POR COBRAR (FIADOS)
+// 6. PAGOS PARCIALES Y CUENTAS POR COBRAR
 // ==========================================
 app.post('/api/pedidos/:id/pagos', async (req, res) => {
     try {
@@ -291,9 +312,7 @@ app.post('/api/pedidos/:id/pagos', async (req, res) => {
 
         await pool.query(`UPDATE pedidos SET estado_pago = 'Parcial' WHERE id = $1`, [pedido_id]);
 
-        // Si la base es COP, restamos el equivalente en COP de la deuda
         if (cliente_id) {
-            // Suponiendo que el pago entra en pesos, o se convierte a pesos según la tasa_aplicada
             const abono_en_cop = moneda_pago === 'COP' ? monto_pagado : (monto_pagado * tasa_aplicada);
             await pool.query(
                 `UPDATE clientes SET deuda_total = deuda_total - $1 WHERE id = $2`,
@@ -307,7 +326,6 @@ app.post('/api/pedidos/:id/pagos', async (req, res) => {
     }
 });
 
-// MÓDULO DE COBRANZA 
 app.get('/api/clientes/deudores', async (req, res) => {
     try {
         const deudores = await pool.query(`
@@ -326,10 +344,21 @@ app.get('/api/clientes/deudores', async (req, res) => {
     }
 });
 
-// Cobrar una deuda a un cliente
 app.post('/api/clientes/:id/pagar-deuda', async (req, res) => {
     try {
         const { monto_abonado } = req.body;
+
+        // VALIDACIONES: Evitar que el cajero se equivoque
+        if (!monto_abonado || parseFloat(monto_abonado) <= 0) {
+            return res.status(400).json({ error: 'El abono debe ser mayor a 0' });
+        }
+
+        const deudaActualRes = await pool.query('SELECT deuda_total FROM clientes WHERE id = $1', [req.params.id]);
+        const deudaActual = parseFloat(deudaActualRes.rows[0].deuda_total);
+
+        if (parseFloat(monto_abonado) > deudaActual) {
+            return res.status(400).json({ error: 'No puede abonar una cantidad mayor a la deuda actual' });
+        }
 
         // 1. Descontamos el dinero de la deuda del cliente
         await pool.query('UPDATE clientes SET deuda_total = deuda_total - $1 WHERE id = $2', [monto_abonado, req.params.id]);
