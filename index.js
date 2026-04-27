@@ -204,7 +204,8 @@ app.get('/api/pedidos/abiertos', async (req, res) => {
 
 app.post('/api/checkout', async (req, res) => {
     try {
-        const { cedula, nombre, turno, carrito, pedido_id_existente } = req.body;
+        // 1. Recibimos el "abono" desde React
+        const { cedula, nombre, turno, carrito, pedido_id_existente, abono } = req.body;
         let cliente_id = null;
 
         if (cedula) {
@@ -217,15 +218,27 @@ app.post('/api/checkout', async (req, res) => {
             }
         }
 
-        let pedido_id = pedido_id_existente;
         let total_cop_carrito = carrito.reduce((acc, item) => acc + (parseFloat(item.precio_venta_cop) * item.cantidad), 0);
 
+        // 2. CÁLCULO DE LA DEUDA Y EL ABONO
+        // Si la caja del abono viene vacía, asumimos que pagó el 100%
+        let monto_pagado = (abono !== undefined && abono !== '') ? parseFloat(abono) : total_cop_carrito;
+        let deuda_generada = total_cop_carrito - monto_pagado;
+
+        // 3. REGLA DE ORO: No hay fiado para fantasmas
+        if (deuda_generada > 0 && !cliente_id) {
+            return res.status(400).json({ error: 'Para registrar un fiado, debes ingresar la cédula y el nombre del cliente.' });
+        }
+
+        let estado = deuda_generada > 0 ? 'Parcial' : 'Pagado';
+        let pedido_id = pedido_id_existente;
+
         if (pedido_id) {
-            await pool.query('UPDATE pedidos SET total_cop = total_cop + $1 WHERE id = $2', [total_cop_carrito, pedido_id]);
+            await pool.query('UPDATE pedidos SET total_cop = total_cop + $1, estado_pago = $2 WHERE id = $3', [total_cop_carrito, estado, pedido_id]);
         } else {
             const nuevoPed = await pool.query(
-                "INSERT INTO pedidos (cliente_id, total_cop, turno, estado_pago) VALUES ($1, $2, $3, 'Abierto') RETURNING id",
-                [cliente_id, total_cop_carrito, turno]
+                "INSERT INTO pedidos (cliente_id, total_cop, turno, estado_pago) VALUES ($1, $2, $3, $4) RETURNING id",
+                [cliente_id, total_cop_carrito, turno, estado]
             );
             pedido_id = nuevoPed.rows[0].id;
         }
@@ -237,9 +250,20 @@ app.post('/api/checkout', async (req, res) => {
             );
         }
 
-        res.json({ mensaje: 'Operación exitosa', pedido_id });
+        // 4. GUARDAR LA DEUDA AL CLIENTE
+        if (deuda_generada > 0 && cliente_id) {
+            await pool.query('UPDATE clientes SET deuda_total = COALESCE(deuda_total, 0) + $1 WHERE id = $2', [deuda_generada, cliente_id]);
+        }
+
+        // 5. REGISTRAR EL DINERO QUE ENTRÓ A CAJA
+        if (monto_pagado > 0) {
+            await pool.query('INSERT INTO pagos (pedido_id, monto_pagado, moneda_pago, tasa_aplicada) VALUES ($1, $2, $3, $4)', [pedido_id, monto_pagado, 'COP', 1]);
+        }
+
+        res.json({ mensaje: '¡Operación procesada con éxito!', pedido_id });
     } catch (err) {
-        res.status(500).send('Error procesando venta');
+        console.error("🔥 Error procesando venta:", err);
+        res.status(500).json({ error: 'Error interno en el servidor' });
     }
 });
 
