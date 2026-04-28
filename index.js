@@ -377,6 +377,74 @@ app.post('/api/clientes/:id/pagar-deuda', async (req, res) => {
     }
 });
 
+
+// ==========================================
+// 7. CONTROL DE GASTOS Y COMPRAS
+// ==========================================
+
+// Obtener todos los gastos
+app.get('/api/gastos', async (req, res) => {
+    try {
+        // Los ordenamos por fecha y por ID para que los más nuevos salgan primero
+        const gastos = await pool.query('SELECT * FROM gastos ORDER BY fecha DESC, id DESC');
+        res.json(gastos.rows);
+    } catch (err) {
+        console.error("🔥 Error obteniendo gastos:", err.message);
+        res.status(500).json({ error: 'Error interno obteniendo el historial de gastos' });
+    }
+});
+
+// Registrar un nuevo gasto
+app.post('/api/gastos', async (req, res) => {
+    try {
+        const { concepto, monto_cop, fecha } = req.body;
+
+        // VALIDACIÓN: Seguridad desde el backend
+        if (!concepto || concepto.trim() === '') {
+            return res.status(400).json({ error: 'El concepto del gasto es obligatorio' });
+        }
+        if (!monto_cop || parseFloat(monto_cop) <= 0) {
+            return res.status(400).json({ error: 'El monto gastado debe ser mayor a 0' });
+        }
+
+        const nuevoGasto = await pool.query(
+            'INSERT INTO gastos (concepto, monto_cop, fecha) VALUES ($1, $2, $3) RETURNING *',
+            [concepto, monto_cop, fecha]
+        );
+
+        res.json({ mensaje: '✅ Gasto registrado con éxito', gasto: nuevoGasto.rows[0] });
+    } catch (err) {
+        console.error("🔥 Error registrando gasto:", err.message);
+        res.status(500).json({ error: 'Error interno registrando el gasto en la base de datos' });
+    }
+});
+
+// Eliminar un gasto por si el admin se equivoca
+app.delete('/api/gastos/:id', async (req, res) => {
+    try {
+        await pool.query('DELETE FROM gastos WHERE id = $1', [req.params.id]);
+        res.json({ mensaje: '🗑️ Gasto eliminado correctamente' });
+    } catch (err) {
+        console.error("🔥 Error eliminando gasto:", err.message);
+        res.status(500).json({ error: 'Error interno eliminando el gasto' });
+    }
+});
+
+// Ruta para obtener todas las ventas (necesario para las gráficas de crecimiento)
+app.get('/api/ventas/todas', async (req, res) => {
+    try {
+        const ventas = await pool.query(`
+          SELECT p.id, p.total_cop, p.fecha_hora, p.estado_pago,
+                 COALESCE((SELECT SUM(monto_pagado) FROM pagos WHERE pedido_id = p.id), 0) AS pagado
+          FROM pedidos p
+          ORDER BY p.fecha_hora ASC
+        `);
+        res.json(ventas.rows);
+    } catch (err) {
+        res.status(500).json({ error: 'Error cargando histórico de ventas' });
+    }
+});
+
 // ==========================================
 // ARRANQUE DEL SERVIDOR
 // ==========================================
